@@ -1,0 +1,1 @@
+Build an original, complete, playable offline stealth game for desktop browser — a level seen from above, guards with vision cones, cover to hide behind, and an exit to reach unseen.

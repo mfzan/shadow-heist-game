@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shadow Heist — Stealth Game</title>
+<style>
+  :root {
+    --ink: #dfe6e9;
+    --muted: #b2bec3;
+    --green: #2ecc71;
+    --red: #e74c3c;
+    --gold: #f7b731;
+    --card: #2d3436;
+    --bg: #1e2228;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  header {
+    width: 100%;
+    max-width: 1020px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 14px 18px 6px;
+    flex-wrap: wrap;
+  }
+  .logo { font-size: 26px; font-weight: 800; letter-spacing: -0.5px; }
+  .logo span { color: var(--gold); }
+  .hud {
+    margin-left: auto;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .pill {
+    background: var(--card);
+    border-radius: 999px;
+    padding: 7px 14px;
+    font-size: 14px;
+    font-weight: 600;
+    box-shadow: 0 1px 4px rgba(0,0,0,.4);
+    white-space: nowrap;
+  }
+  .pill b { color: var(--gold); }
+  .pill.time b { color: #ff7675; }
+  button {
+    font-family: inherit;
+    font-size: 15px;
+    font-weight: 700;
+    border: none;
+    border-radius: 999px;
+    padding: 9px 18px;
+    cursor: pointer;
+    background: var(--gold);
+    color: #2d3436;
+    box-shadow: 0 2px 6px rgba(0,0,0,.3);
+  }
+  button:hover { filter: brightness(1.08); }
+  button.ghost { background: var(--card); color: var(--ink); }
+  .alarmwrap { width: 100%; max-width: 1020px; padding: 0 18px; display: flex; align-items: center; gap: 10px; }
+  .alarmwrap .lbl { font-size: 13px; font-weight: 700; color: var(--muted); width: 74px; }
+  .alarmbar {
+    flex: 1;
+    height: 9px;
+    background: #3d4548;
+    border-radius: 99px;
+    overflow: hidden;
+  }
+  .alarmbar div {
+    height: 100%;
+    background: var(--gold);
+    border-radius: 99px;
+    transition: width .15s linear;
+  }
+  .alarmbar div.hot { background: var(--red); }
+  main {
+    width: 100%;
+    max-width: 1020px;
+    padding: 10px 18px;
+    display: flex;
+    justify-content: center;
+  }
+  .panel {
+    background: #111;
+    border-radius: 14px;
+    padding: 10px;
+    box-shadow: 0 4px 18px rgba(0,0,0,.5);
+  }
+  canvas {
+    display: block;
+    width: 960px;
+    max-width: calc(100vw - 56px);
+    height: auto;
+    border-radius: 8px;
+  }
+  footer {
+    width: 100%;
+    max-width: 1020px;
+    padding: 4px 18px 18px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+  #msg { font-size: 15px; font-weight: 600; min-height: 22px; color: var(--muted); }
+  .dots { display: flex; gap: 6px; margin-left: auto; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; background: #636e72; }
+  .dot.done { background: var(--green); }
+  .dot.now { background: var(--gold); box-shadow: 0 0 0 3px rgba(247,183,49,.35); }
+  #overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(10,12,14,.72);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 10;
+  }
+  #overlay.hidden { display: none; }
+  #overlay .card {
+    background: #2d3436;
+    color: var(--ink);
+    border-radius: 18px;
+    padding: 30px 36px;
+    max-width: 500px;
+    text-align: center;
+    box-shadow: 0 12px 40px rgba(0,0,0,.5);
+  }
+  #overlay h1 { margin: 0 0 4px; font-size: 40px; letter-spacing: -1px; }
+  #overlay h2 { margin: 0 0 8px; font-size: 28px; }
+  #overlay .tag { color: var(--muted); font-weight: 600; margin: 0 0 14px; }
+  #overlay p { line-height: 1.55; }
+  #overlay .big { font-size: 20px; }
+  #overlay .muted { color: var(--muted); }
+  #overlay .small { font-size: 13px; }
+  #overlay button { margin-top: 10px; font-size: 17px; padding: 12px 26px; }
+</style>
+</head>
+<body>
+  <header>
+    <div class="logo">🌑 Shadow <span>Heist</span></div>
+    <div class="hud">
+      <div class="pill" id="levelName">Level 1 · The Gallery</div>
+      <div class="pill">💎 Loot <b id="lootCount">0 / 5</b></div>
+      <div class="pill time">⏱ <b id="timeLeft">120s</b></div>
+      <div class="pill">Score <b id="score">0</b></div>
+      <button id="muteBtn" class="ghost">🔊 Sound</button>
+    </div>
+  </header>
+  <div class="alarmwrap">
+    <span class="lbl" id="alarmLabel">unseen</span>
+    <div class="alarmbar"><div id="alarmBar" style="width:0%"></div></div>
+  </div>
+  <main>
+    <div class="panel"><canvas id="game" width="960" height="600"></canvas></div>
+  </main>
+  <footer>
+    <div id="msg">WASD / arrows to move · hold Shift to sneak · grab every gem, then reach the green EXIT.</div>
+    <div class="dots"><span class="dot now"></span><span class="dot"></span><span class="dot"></span></div>
+  </footer>
+  <div id="overlay" class="hidden"></div>
+  <script type="module" src="src/game.js"></script>
+</body>
+</html>
