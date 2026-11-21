@@ -1,47 +1,71 @@
-// Shadow Heist — engine. Top-down stealth: move with WASD or arrows,
-// hold Shift to sneak (slower, quieter, harder to spot). Guards patrol
-// with vision cones; crates block their sight, bushes hide you. Grab all
-// the loot, then reach the exit unseen. Getting spotted fills the alarm —
-// break line of sight before it maxes out and you get a second chance.
+// Shadow Heist — the engine, rewritten. Top-down stealth on a canvas:
+// slip past patrolling sentries, grab every gem, reach the exit unseen.
+// Move with WASD or arrows; hold Shift to sneak (slower, quieter, harder
+// to spot). Crates block a sentry's sight, bushes hide you outright, and
+// a vision cone turning red means break line of sight, fast — the alarm
+// drains the moment you do, so a near miss is a second chance, not a loss.
 
 import { LEVELS, TILE } from './levels.js';
 import { sfx, setMuted, isMuted } from './audio.js';
 
-const $ = (id) => document.getElementById(id);
-const cv = $('game');
-const ctx = cv.getContext('2d');
-const W = 24 * TILE;
-const H = 15 * TILE;
-const CONE_RANGE = 200;
-const CONE_HALF = 0.6; // radians either side of facing
+// ---- tuning: one place for every number the feel depends on ----
+const TUNING = {
+  boardW: 24 * TILE,
+  boardH: 15 * TILE,
+  thiefRadius: 14,
+  sentryRadius: 14,
+  walkSpeed: 175,
+  sneakSpeed: 95,
+  coneRange: 200,
+  coneHalfAngle: 0.6,
+  pickupRadius: 26,
+  exitRadius: 30,
+  spotRateWalk: 55,
+  spotRateSneak: 26,
+  suspicionDecay: 22,
+  chaseSpeedBoost: 1.35,
+  sneakConeShrink: 0.6,
+  footstepChance: 2.2,
+  hearRadius: 420,
+};
 
+// ---- run state ----
 let phase = 'title'; // title | playing | caught | levelDone | win
-let level = 0;
-let map = [];
-let loot = []; // { x, y, taken }
-let exit = { x: 0, y: 0 };
-let player = { x: 0, y: 0, r: 14, dir: 0, sneaking: false };
-let guards = []; // { x, y, dir, wp, wpi, speed, state, sus, lastSeen, wait }
-let keys = {};
-let alarm = 0; // 0..100, the highest guard suspicion
-let spotted = false; // any guard fully alerted this level
+let levelIndex = 0;
+let grid = [];
+let gems = []; // { x, y, taken }
+let exitSpot = { x: 0, y: 0 };
+let thief = { x: 0, y: 0, r: TUNING.thiefRadius, facing: 0, sneaking: false };
+let sentries = []; // { x, y, dir, route, routeIndex, speed, mode, suspicion, lastSeen, pause }
+let pressed = {};
+let alarm = 0; // 0..100, the worst sentry suspicion right now
+let everSpotted = false; // any sentry fully alerted on this level
 let score = 0;
 let timeLeft = 0;
-let timerId = null;
-let stepTimer = 0;
+let clockId = null;
+let strideTimer = 0;
 let lastTickSecond = -1;
+let frame = 0;
 
+const $ = (id) => document.getElementById(id);
+const canvas = $('game');
+const paint = canvas.getContext('2d');
+
+// ---- tiles ----
 function tileAt(px, py) {
-  const tx = Math.floor(px / TILE), ty = Math.floor(py / TILE);
-  if (tx < 0 || ty < 0 || ty >= map.length || tx >= map[0].length) return '#';
-  return map[ty][tx];
+  const tx = Math.floor(px / TILE);
+  const ty = Math.floor(py / TILE);
+  if (tx < 0 || ty < 0 || ty >= grid.length || tx >= grid[0].length) return '#';
+  return grid[ty][tx];
 }
-function isSolid(t) { return t === '#' || t === 'C'; }
-function blocksSight(t) { return t === '#' || t === 'C'; }
+const isSolid = (t) => t === '#' || t === 'C';
+const blocksSight = (t) => t === '#' || t === 'C';
+const inBush = (x, y) => tileAt(x, y) === 'B';
 
-// line of sight between two points, blocked by walls and crates
-function hasLOS(x0, y0, x1, y1) {
-  const dx = x1 - x0, dy = y1 - y0;
+// Straight-line sight between two points, cut by walls and crates.
+function canSee(x0, y0, x1, y1) {
+  const dx = x1 - x0;
+  const dy = y1 - y0;
   const dist = Math.hypot(dx, dy);
   const steps = Math.ceil(dist / 8);
   for (let i = 1; i < steps; i++) {
@@ -50,308 +74,373 @@ function hasLOS(x0, y0, x1, y1) {
   }
   return true;
 }
-function inBush(x, y) { return tileAt(x, y) === 'B'; }
 
+// ---- levels ----
 function loadLevel(i) {
-  level = i;
-  const L = LEVELS[i];
-  map = L.map.map((row) => row.split(''));
-  loot = [];
-  guards = [];
+  levelIndex = i;
+  const def = LEVELS[i];
+  grid = def.map.map((row) => row.split(''));
+  gems = [];
+  sentries = [];
   alarm = 0;
-  spotted = false;
-  timeLeft = L.par;
-  for (let y = 0; y < map.length; y++) {
-    for (let x = 0; x < map[y].length; x++) {
-      const t = map[y][x];
-      const cx = x * TILE + TILE / 2, cy = y * TILE + TILE / 2;
-      if (t === 'P') { player.x = cx; player.y = cy; map[y][x] = '.'; }
-      if (t === 'L') { loot.push({ x: cx, y: cy, taken: false }); map[y][x] = '.'; }
-      if (t === 'E') { exit = { x: cx, y: cy }; map[y][x] = '.'; }
+  everSpotted = false;
+  timeLeft = def.par;
+  for (let y = 0; y < grid.length; y++) {
+    for (let x = 0; x < grid[y].length; x++) {
+      const cell = grid[y][x];
+      const cx = x * TILE + TILE / 2;
+      const cy = y * TILE + TILE / 2;
+      if (cell === 'P') { thief.x = cx; thief.y = cy; grid[y][x] = '.'; }
+      if (cell === 'L') { gems.push({ x: cx, y: cy, taken: false }); grid[y][x] = '.'; }
+      if (cell === 'E') { exitSpot = { x: cx, y: cy }; grid[y][x] = '.'; }
     }
   }
-  for (const g of L.guards) {
-    const [sx, sy] = g.waypoints[0];
-    guards.push({
-      x: sx * TILE + TILE / 2, y: sy * TILE + TILE / 2, r: 14,
-      dir: 0, wp: g.waypoints.map(([wx, wy]) => ({ x: wx * TILE + TILE / 2, y: wy * TILE + TILE / 2 })),
-      wpi: 1, speed: g.speed * TILE, state: 'patrol', sus: 0, lastSeen: null, wait: 0,
+  for (const patrol of def.guards) {
+    const [sx, sy] = patrol.waypoints[0];
+    sentries.push({
+      x: sx * TILE + TILE / 2,
+      y: sy * TILE + TILE / 2,
+      r: TUNING.sentryRadius,
+      dir: 0,
+      route: patrol.waypoints.map(([wx, wy]) => ({ x: wx * TILE + TILE / 2, y: wy * TILE + TILE / 2 })),
+      routeIndex: 1,
+      speed: patrol.speed * TILE,
+      mode: 'patrol', // patrol | chase | search
+      suspicion: 0,
+      lastSeen: null,
+      pause: 0,
     });
   }
   phase = 'playing';
   hideOverlay();
-  updateHUD();
-  clearInterval(timerId);
-  timerId = setInterval(() => {
+  refreshHUD();
+  clearInterval(clockId);
+  clockId = setInterval(() => {
     if (phase !== 'playing') return;
     timeLeft -= 0.1;
     if (timeLeft <= 10 && Math.ceil(timeLeft) !== lastTickSecond) {
       lastTickSecond = Math.ceil(timeLeft);
       if (timeLeft > 0) sfx.click();
     }
-    if (timeLeft <= 0) { timeLeft = 0; caught('Time\'s up — the vault sealed itself.'); }
-    updateHUD();
+    if (timeLeft <= 0) {
+      timeLeft = 0;
+      caught('Time\u2019s up \u2014 the vault sealed itself.');
+    }
+    refreshHUD();
   }, 100);
 }
 
-function moveCircle(e, dx, dy) {
-  const nx = e.x + dx;
-  if (!isSolid(tileAt(nx + Math.sign(dx) * e.r, e.y - e.r + 2)) &&
-      !isSolid(tileAt(nx + Math.sign(dx) * e.r, e.y + e.r - 2))) e.x = nx;
-  const ny = e.y + dy;
-  if (!isSolid(tileAt(e.x - e.r + 2, ny + Math.sign(dy) * e.r)) &&
-      !isSolid(tileAt(e.x + e.r - 2, ny + Math.sign(dy) * e.r))) e.y = ny;
+// Slide a circle along one axis, stopping at solid tiles.
+function slide(body, dx, dy) {
+  const nx = body.x + dx;
+  if (
+    !isSolid(tileAt(nx + Math.sign(dx) * body.r, body.y - body.r + 2)) &&
+    !isSolid(tileAt(nx + Math.sign(dx) * body.r, body.y + body.r - 2))
+  ) body.x = nx;
+  const ny = body.y + dy;
+  if (
+    !isSolid(tileAt(body.x - body.r + 2, ny + Math.sign(dy) * body.r)) &&
+    !isSolid(tileAt(body.x + body.r - 2, ny + Math.sign(dy) * body.r))
+  ) body.y = ny;
 }
 
+// ---- the tick ----
 function update(dt) {
   if (phase !== 'playing') return;
-  // --- player ---
-  let mx = (keys['arrowright'] || keys['d'] ? 1 : 0) - (keys['arrowleft'] || keys['a'] ? 1 : 0);
-  let my = (keys['arrowdown'] || keys['s'] ? 1 : 0) - (keys['arrowup'] || keys['w'] ? 1 : 0);
-  player.sneaking = !!keys['shift'];
-  const speed = player.sneaking ? 95 : 175;
+
+  // --- the thief ---
+  const mx =
+    (pressed['arrowright'] || pressed['d'] ? 1 : 0) -
+    (pressed['arrowleft'] || pressed['a'] ? 1 : 0);
+  const my =
+    (pressed['arrowdown'] || pressed['s'] ? 1 : 0) -
+    (pressed['arrowup'] || pressed['w'] ? 1 : 0);
+  thief.sneaking = !!pressed['shift'];
+  const pace = thief.sneaking ? TUNING.sneakSpeed : TUNING.walkSpeed;
   if (mx || my) {
     const len = Math.hypot(mx, my);
-    mx /= len; my /= len;
-    player.dir = Math.atan2(my, mx);
-    moveCircle(player, mx * speed * dt, my * speed * dt);
-    stepTimer -= dt;
-    if (stepTimer <= 0) {
-      stepTimer = player.sneaking ? 0.55 : 0.34;
-      if (player.sneaking) sfx.sneakStep();
+    const nx = mx / len;
+    const ny = my / len;
+    thief.facing = Math.atan2(ny, nx);
+    slide(thief, nx * pace * dt, ny * pace * dt);
+    strideTimer -= dt;
+    if (strideTimer <= 0) {
+      strideTimer = thief.sneaking ? 0.55 : 0.34;
+      if (thief.sneaking) sfx.sneakStep();
     }
   }
-  // loot pickup
-  for (const l of loot) {
-    if (!l.taken && Math.hypot(player.x - l.x, player.y - l.y) < 26) {
-      l.taken = true;
+
+  // --- gems ---
+  for (const gem of gems) {
+    if (!gem.taken && Math.hypot(thief.x - gem.x, thief.y - gem.y) < TUNING.pickupRadius) {
+      gem.taken = true;
       score += 100;
       sfx.pickup();
-      $('msg').textContent = 'Loot grabbed! ' + loot.filter((x) => x.taken).length + ' / ' + loot.length;
+      $('msg').textContent =
+        'Loot grabbed! ' + gems.filter((g) => g.taken).length + ' / ' + gems.length;
     }
   }
-  const allLoot = loot.every((l) => l.taken);
-  if (allLoot && Math.hypot(player.x - exit.x, player.y - exit.y) < 30) {
+  const lootedAll = gems.every((g) => g.taken);
+  if (lootedAll && Math.hypot(thief.x - exitSpot.x, thief.y - exitSpot.y) < TUNING.exitRadius) {
     levelComplete();
     return;
   }
-  // --- guards ---
-  let maxSus = 0;
-  for (const g of guards) {
-    // target point
-    let tx, ty, spd = g.speed;
-    if (g.state === 'chase') {
-      tx = g.lastSeen.x; ty = g.lastSeen.y; spd = g.speed * 1.35;
+
+  // --- sentries ---
+  let worst = 0;
+  for (const sentry of sentries) {
+    // Where is it headed, and how fast?
+    let tx, ty;
+    let pace = sentry.speed;
+    if (sentry.mode === 'chase') {
+      tx = sentry.lastSeen.x;
+      ty = sentry.lastSeen.y;
+      pace = sentry.speed * TUNING.chaseSpeedBoost;
     } else {
-      tx = g.wp[g.wpi].x; ty = g.wp[g.wpi].y;
+      tx = sentry.route[sentry.routeIndex].x;
+      ty = sentry.route[sentry.routeIndex].y;
     }
-    const dx = tx - g.x, dy = ty - g.y;
+    const dx = tx - sentry.x;
+    const dy = ty - sentry.y;
     const dist = Math.hypot(dx, dy);
-    if (g.state === 'chase' && dist < 8) {
-      g.state = 'search';
-      g.wait = 1.6;
-    } else if (g.state === 'search') {
-      g.wait -= dt;
-      g.dir += dt * 1.5; // look around
-      if (g.wait <= 0) g.state = 'patrol';
+    if (sentry.mode === 'chase' && dist < 8) {
+      sentry.mode = 'search';
+      sentry.pause = 1.6;
+    } else if (sentry.mode === 'search') {
+      sentry.pause -= dt;
+      sentry.dir += dt * 1.5; // scan the room
+      if (sentry.pause <= 0) sentry.mode = 'patrol';
     } else if (dist > 4) {
-      g.dir = Math.atan2(dy, dx);
-      moveCircle(g, (dx / dist) * spd * dt, (dy / dist) * spd * dt);
-      if (g.state === 'patrol' && dist < 6) g.wpi = (g.wpi + 1) % g.wp.length;
+      sentry.dir = Math.atan2(dy, dx);
+      slide(sentry, (dx / dist) * pace * dt, (dy / dist) * pace * dt);
+      if (sentry.mode === 'patrol' && dist < 6) {
+        sentry.routeIndex = (sentry.routeIndex + 1) % sentry.route.length;
+      }
     }
-    // guard footsteps: louder when closer to you
-    const pd = Math.hypot(player.x - g.x, player.y - g.y);
-    stepTimer -= 0;
-    if (Math.random() < dt * 2.2) sfx.step(Math.max(0, 1 - pd / 420));
-    // --- vision ---
-    const hidden = inBush(player.x, player.y);
-    const inRange = pd < CONE_RANGE * (player.sneaking ? 0.6 : 1);
-    let ang = Math.atan2(player.y - g.y, player.x - g.x) - g.dir;
+
+    // Footsteps: the closer a sentry, the louder its tread.
+    const gap = Math.hypot(thief.x - sentry.x, thief.y - sentry.y);
+    if (Math.random() < dt * TUNING.footstepChance) {
+      sfx.step(Math.max(0, 1 - gap / TUNING.hearRadius));
+    }
+
+    // --- vision: range, cone, line of sight, bushes ---
+    const hidden = inBush(thief.x, thief.y);
+    const reach = TUNING.coneRange * (thief.sneaking ? TUNING.sneakConeShrink : 1);
+    const close = gap < reach;
+    let ang = Math.atan2(thief.y - sentry.y, thief.x - sentry.x) - sentry.dir;
     while (ang > Math.PI) ang -= Math.PI * 2;
     while (ang < -Math.PI) ang += Math.PI * 2;
-    const inCone = Math.abs(ang) < CONE_HALF;
-    const seen = inRange && inCone && hasLOS(g.x, g.y, player.x, player.y) && !hidden;
+    const inside = Math.abs(ang) < TUNING.coneHalfAngle;
+    const seen = close && inside && canSee(sentry.x, sentry.y, thief.x, thief.y) && !hidden;
     if (seen) {
-      const rate = (player.sneaking ? 26 : 55) * (1.6 - Math.min(1, pd / CONE_RANGE));
-      g.sus = Math.min(100, g.sus + rate * dt);
-      g.lastSeen = { x: player.x, y: player.y };
-      if (g.sus > 50 && g.state === 'patrol') {
-        g.state = 'chase';
+      const base = thief.sneaking ? TUNING.spotRateSneak : TUNING.spotRateWalk;
+      const rate = base * (1.6 - Math.min(1, gap / TUNING.coneRange));
+      sentry.suspicion = Math.min(100, sentry.suspicion + rate * dt);
+      sentry.lastSeen = { x: thief.x, y: thief.y };
+      if (sentry.suspicion > 50 && sentry.mode === 'patrol') {
+        sentry.mode = 'chase';
         sfx.suspicious();
-        $('msg').textContent = 'A guard heard something…';
+        $('msg').textContent = 'A guard heard something\u2026';
       }
-      if (g.sus >= 100) {
-        spotted = true;
+      if (sentry.suspicion >= 100) {
+        everSpotted = true;
         sfx.spotted();
         caught('Spotted! The guard raised the alarm.');
         return;
       }
     } else {
-      g.sus = Math.max(0, g.sus - 22 * dt);
-      if (g.state === 'chase' && g.sus < 25) g.state = 'patrol';
+      sentry.suspicion = Math.max(0, sentry.suspicion - TUNING.suspicionDecay * dt);
+      if (sentry.mode === 'chase' && sentry.suspicion < 25) sentry.mode = 'patrol';
     }
-    maxSus = Math.max(maxSus, g.sus);
+    worst = Math.max(worst, sentry.suspicion);
   }
-  alarm = maxSus;
-  updateHUD();
+  alarm = worst;
+  refreshHUD();
 }
 
-// ---------- drawing ----------
+// ---- drawing ----
 function draw() {
-  ctx.clearRect(0, 0, W, H);
-  // floor
-  for (let y = 0; y < map.length; y++) {
-    for (let x = 0; x < map[y].length; x++) {
-      const px = x * TILE, py = y * TILE;
-      const t = map[y][x];
-      if (t === '#') {
-        ctx.fillStyle = '#2d3436';
-        ctx.fillRect(px, py, TILE, TILE);
-        ctx.fillStyle = '#3d4548';
-        ctx.fillRect(px, py, TILE, 5);
+  const W = TUNING.boardW;
+  const H = TUNING.boardH;
+  paint.clearRect(0, 0, W, H);
+
+  // Floor, walls, crates, bushes.
+  for (let y = 0; y < grid.length; y++) {
+    for (let x = 0; x < grid[y].length; x++) {
+      const px = x * TILE;
+      const py = y * TILE;
+      const cell = grid[y][x];
+      if (cell === '#') {
+        paint.fillStyle = '#2d3436';
+        paint.fillRect(px, py, TILE, TILE);
+        paint.fillStyle = '#3d4548';
+        paint.fillRect(px, py, TILE, 5);
       } else {
-        ctx.fillStyle = (x + y) % 2 === 0 ? '#3a3f4a' : '#353a45';
-        ctx.fillRect(px, py, TILE, TILE);
-        if (t === 'C') {
-          ctx.fillStyle = '#8b5a2b';
-          ctx.fillRect(px + 4, py + 4, TILE - 8, TILE - 8);
-          ctx.strokeStyle = '#6c4a2f';
-          ctx.lineWidth = 2;
-          ctx.strokeRect(px + 4, py + 4, TILE - 8, TILE - 8);
-          ctx.beginPath();
-          ctx.moveTo(px + 4, py + 4);
-          ctx.lineTo(px + TILE - 4, py + TILE - 4);
-          ctx.moveTo(px + TILE - 4, py + 4);
-          ctx.lineTo(px + 4, py + TILE - 4);
-          ctx.stroke();
+        paint.fillStyle = (x + y) % 2 === 0 ? '#3a3f4a' : '#353a45';
+        paint.fillRect(px, py, TILE, TILE);
+        if (cell === 'C') {
+          paint.fillStyle = '#8b5a2b';
+          paint.fillRect(px + 4, py + 4, TILE - 8, TILE - 8);
+          paint.strokeStyle = '#6c4a2f';
+          paint.lineWidth = 2;
+          paint.strokeRect(px + 4, py + 4, TILE - 8, TILE - 8);
+          paint.beginPath();
+          paint.moveTo(px + 4, py + 4);
+          paint.lineTo(px + TILE - 4, py + TILE - 4);
+          paint.moveTo(px + TILE - 4, py + 4);
+          paint.lineTo(px + 4, py + TILE - 4);
+          paint.stroke();
         }
-        if (t === 'B') {
-          ctx.fillStyle = '#27ae60';
-          ctx.beginPath();
-          ctx.arc(px + 12, py + 14, 10, 0, Math.PI * 2);
-          ctx.arc(px + 26, py + 10, 11, 0, Math.PI * 2);
-          ctx.arc(px + 20, py + 26, 11, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.fillStyle = '#2ecc71';
-          ctx.beginPath();
-          ctx.arc(px + 16, py + 18, 6, 0, Math.PI * 2);
-          ctx.arc(px + 28, py + 24, 5, 0, Math.PI * 2);
-          ctx.fill();
+        if (cell === 'B') {
+          paint.fillStyle = '#27ae60';
+          paint.beginPath();
+          paint.arc(px + 12, py + 14, 10, 0, Math.PI * 2);
+          paint.arc(px + 26, py + 10, 11, 0, Math.PI * 2);
+          paint.arc(px + 20, py + 26, 11, 0, Math.PI * 2);
+          paint.fill();
+          paint.fillStyle = '#2ecc71';
+          paint.beginPath();
+          paint.arc(px + 16, py + 18, 6, 0, Math.PI * 2);
+          paint.arc(px + 28, py + 24, 5, 0, Math.PI * 2);
+          paint.fill();
         }
       }
     }
   }
-  // vision cones (under walls' tops, over floor)
-  for (const g of guards) {
-    const hot = g.sus > 50;
-    const grad = ctx.createRadialGradient(g.x, g.y, 10, g.x, g.y, CONE_RANGE);
-    grad.addColorStop(0, hot ? 'rgba(231,76,60,0.55)' : 'rgba(247,183,49,0.45)');
-    grad.addColorStop(1, 'rgba(247,183,49,0)');
-    ctx.fillStyle = grad;
-    ctx.beginPath();
-    ctx.moveTo(g.x, g.y);
-    ctx.arc(g.x, g.y, CONE_RANGE, g.dir - CONE_HALF, g.dir + CONE_HALF);
-    ctx.closePath();
-    ctx.fill();
+
+  // Vision cones: gold while calm, red once a sentry is onto you.
+  for (const sentry of sentries) {
+    const hot = sentry.suspicion > 50;
+    const glow = paint.createRadialGradient(
+      sentry.x, sentry.y, 10, sentry.x, sentry.y, TUNING.coneRange,
+    );
+    glow.addColorStop(0, hot ? 'rgba(231,76,60,0.55)' : 'rgba(247,183,49,0.45)');
+    glow.addColorStop(1, 'rgba(247,183,49,0)');
+    paint.fillStyle = glow;
+    paint.beginPath();
+    paint.moveTo(sentry.x, sentry.y);
+    paint.arc(
+      sentry.x, sentry.y, TUNING.coneRange,
+      sentry.dir - TUNING.coneHalfAngle, sentry.dir + TUNING.coneHalfAngle,
+    );
+    paint.closePath();
+    paint.fill();
   }
-  // exit
-  const allLoot = loot.every((l) => l.taken);
-  ctx.fillStyle = allLoot ? '#2ecc71' : '#636e72';
-  ctx.fillRect(exit.x - 18, exit.y - 18, 36, 36);
-  ctx.fillStyle = '#dfe6e9';
-  ctx.font = 'bold 11px sans-serif';
-  ctx.textAlign = 'center';
-  ctx.fillText(allLoot ? 'EXIT' : 'LOCK', exit.x, exit.y + 4);
-  // loot (gently pulsing, so the gems catch the eye at a glance)
+
+  // Exit: grey and locked until every gem is taken, then green.
+  const lootedAll = gems.every((g) => g.taken);
+  paint.fillStyle = lootedAll ? '#2ecc71' : '#636e72';
+  paint.fillRect(exitSpot.x - 18, exitSpot.y - 18, 36, 36);
+  paint.fillStyle = '#dfe6e9';
+  paint.font = 'bold 11px sans-serif';
+  paint.textAlign = 'center';
+  paint.fillText(lootedAll ? 'EXIT' : 'LOCK', exitSpot.x, exitSpot.y + 4);
+
+  // Gems, gently pulsing so they catch the eye at a glance.
   const pulse = 1 + 0.12 * Math.sin(frame * 0.08);
-  for (const l of loot) {
-    if (l.taken) continue;
-    ctx.fillStyle = '#00cec9';
-    ctx.beginPath();
-    ctx.moveTo(l.x, l.y - 10 * pulse);
-    ctx.lineTo(l.x + 8 * pulse, l.y);
-    ctx.lineTo(l.x, l.y + 10 * pulse);
-    ctx.lineTo(l.x - 8 * pulse, l.y);
-    ctx.closePath();
-    ctx.fill();
-    ctx.fillStyle = '#ffffff';
-    ctx.beginPath();
-    ctx.moveTo(l.x, l.y - 5);
-    ctx.lineTo(l.x + 3, l.y);
-    ctx.lineTo(l.x, l.y + 5);
-    ctx.lineTo(l.x - 3, l.y);
-    ctx.closePath();
-    ctx.fill();
+  for (const gem of gems) {
+    if (gem.taken) continue;
+    paint.fillStyle = '#00cec9';
+    paint.beginPath();
+    paint.moveTo(gem.x, gem.y - 10 * pulse);
+    paint.lineTo(gem.x + 8 * pulse, gem.y);
+    paint.lineTo(gem.x, gem.y + 10 * pulse);
+    paint.lineTo(gem.x - 8 * pulse, gem.y);
+    paint.closePath();
+    paint.fill();
+    paint.fillStyle = '#ffffff';
+    paint.beginPath();
+    paint.moveTo(gem.x, gem.y - 5);
+    paint.lineTo(gem.x + 3, gem.y);
+    paint.lineTo(gem.x, gem.y + 5);
+    paint.lineTo(gem.x - 3, gem.y);
+    paint.closePath();
+    paint.fill();
   }
-  // guards
-  for (const g of guards) {
-    ctx.fillStyle = g.sus > 50 ? '#e74c3c' : '#e17055';
-    ctx.beginPath();
-    ctx.arc(g.x, g.y, 14, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#2d3436';
-    ctx.beginPath();
-    ctx.arc(g.x + Math.cos(g.dir) * 7, g.y + Math.sin(g.dir) * 7, 5, 0, Math.PI * 2);
-    ctx.fill();
-    // suspicion ring
-    if (g.sus > 2) {
-      ctx.strokeStyle = g.sus > 50 ? '#e74c3c' : '#f7b731';
-      ctx.lineWidth = 3;
-      ctx.beginPath();
-      ctx.arc(g.x, g.y, 19, -Math.PI / 2, -Math.PI / 2 + (g.sus / 100) * Math.PI * 2);
-      ctx.stroke();
+
+  // Sentries, with a suspicion ring that fills as they get sure of you.
+  for (const sentry of sentries) {
+    paint.fillStyle = sentry.suspicion > 50 ? '#e74c3c' : '#e17055';
+    paint.beginPath();
+    paint.arc(sentry.x, sentry.y, 14, 0, Math.PI * 2);
+    paint.fill();
+    paint.fillStyle = '#2d3436';
+    paint.beginPath();
+    paint.arc(
+      sentry.x + Math.cos(sentry.dir) * 7,
+      sentry.y + Math.sin(sentry.dir) * 7,
+      5, 0, Math.PI * 2,
+    );
+    paint.fill();
+    if (sentry.suspicion > 2) {
+      paint.strokeStyle = sentry.suspicion > 50 ? '#e74c3c' : '#f7b731';
+      paint.lineWidth = 3;
+      paint.beginPath();
+      paint.arc(
+        sentry.x, sentry.y, 19,
+        -Math.PI / 2, -Math.PI / 2 + (sentry.suspicion / 100) * Math.PI * 2,
+      );
+      paint.stroke();
     }
-    if (g.sus > 50) {
-      ctx.fillStyle = '#e74c3c';
-      ctx.font = 'bold 16px sans-serif';
-      ctx.fillText('!', g.x, g.y - 24);
+    if (sentry.suspicion > 50) {
+      paint.fillStyle = '#e74c3c';
+      paint.font = 'bold 16px sans-serif';
+      paint.fillText('!', sentry.x, sentry.y - 24);
     }
   }
-  // player (hooded thief: bright blue with a gold ring, so you can
-  // always pick yourself out against the dark floor at a glance)
-  ctx.fillStyle = '#4a7fb5';
-  ctx.beginPath();
-  ctx.arc(player.x, player.y, player.r, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.strokeStyle = '#f7b731';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.arc(player.x, player.y, player.r, 0, Math.PI * 2);
-  ctx.stroke();
-  ctx.fillStyle = '#f7b731';
-  ctx.beginPath();
-  ctx.arc(player.x + Math.cos(player.dir) * 6, player.y + Math.sin(player.dir) * 6, 5, 0, Math.PI * 2);
-  ctx.fill();
-  if (player.sneaking) {
-    ctx.strokeStyle = 'rgba(247,183,49,0.8)';
-    ctx.lineWidth = 2;
-    ctx.setLineDash([4, 4]);
-    ctx.beginPath();
-    ctx.arc(player.x, player.y, player.r + 5, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.setLineDash([]);
+
+  // The thief: bright blue with a gold ring, so you can always pick
+  // yourself out against the dark floor at a glance.
+  paint.fillStyle = '#4a7fb5';
+  paint.beginPath();
+  paint.arc(thief.x, thief.y, thief.r, 0, Math.PI * 2);
+  paint.fill();
+  paint.strokeStyle = '#f7b731';
+  paint.lineWidth = 2;
+  paint.beginPath();
+  paint.arc(thief.x, thief.y, thief.r, 0, Math.PI * 2);
+  paint.stroke();
+  paint.fillStyle = '#f7b731';
+  paint.beginPath();
+  paint.arc(
+    thief.x + Math.cos(thief.facing) * 6,
+    thief.y + Math.sin(thief.facing) * 6,
+    5, 0, Math.PI * 2,
+  );
+  paint.fill();
+  if (thief.sneaking) {
+    paint.strokeStyle = 'rgba(247,183,49,0.8)';
+    paint.lineWidth = 2;
+    paint.setLineDash([4, 4]);
+    paint.beginPath();
+    paint.arc(thief.x, thief.y, thief.r + 5, 0, Math.PI * 2);
+    paint.stroke();
+    paint.setLineDash([]);
   }
-  // darkness: light radius around the player
-  const dark = ctx.createRadialGradient(player.x, player.y, 90, player.x, player.y, 340);
+
+  // Darkness: a pool of light around the thief, gloom everywhere else.
+  const dark = paint.createRadialGradient(thief.x, thief.y, 90, thief.x, thief.y, 340);
   dark.addColorStop(0, 'rgba(0,0,0,0)');
   dark.addColorStop(1, 'rgba(0,0,0,0.42)');
-  ctx.fillStyle = dark;
-  ctx.fillRect(0, 0, W, H);
+  paint.fillStyle = dark;
+  paint.fillRect(0, 0, W, H);
 }
 
-// ---------- HUD / flow ----------
-function updateHUD() {
-  const L = LEVELS[level];
-  $('levelName').textContent = 'Level ' + (level + 1) + ' · ' + L.name;
-  $('lootCount').textContent = loot.filter((l) => l.taken).length + ' / ' + loot.length;
+// ---- HUD and flow ----
+function refreshHUD() {
+  const def = LEVELS[levelIndex];
+  $('levelName').textContent = 'Level ' + (levelIndex + 1) + ' \u00b7 ' + def.name;
+  $('lootCount').textContent = gems.filter((g) => g.taken).length + ' / ' + gems.length;
   $('score').textContent = score;
   $('timeLeft').textContent = Math.max(0, Math.ceil(timeLeft)) + 's';
   $('alarmBar').style.width = alarm + '%';
   $('alarmBar').classList.toggle('hot', alarm > 50);
-  $('alarmLabel').textContent = alarm > 50 ? 'SPOTTED!' : alarm > 2 ? 'suspicious…' : 'unseen';
+  $('alarmLabel').textContent =
+    alarm > 50 ? 'SPOTTED!' : alarm > 2 ? 'suspicious\u2026' : 'unseen';
   document.querySelectorAll('.dot').forEach((d, i) => {
-    d.classList.toggle('done', i < level);
-    d.classList.toggle('now', i === level);
+    d.classList.toggle('done', i < levelIndex);
+    d.classList.toggle('now', i === levelIndex);
   });
 }
 
@@ -359,58 +448,67 @@ function showOverlay(html) {
   $('overlay').innerHTML = html;
   $('overlay').classList.remove('hidden');
 }
-function hideOverlay() { $('overlay').classList.add('hidden'); }
+function hideOverlay() {
+  $('overlay').classList.add('hidden');
+}
 
 function caught(reason) {
   phase = 'caught';
-  clearInterval(timerId);
+  clearInterval(clockId);
   sfx.caught();
   showOverlay(
     '<h2>Caught!</h2>' +
     '<p>' + reason + '</p>' +
-    '<p class="muted">Tip: wait for the cone to turn away, sneak (Shift) past, and use crates to break line of sight.</p>' +
-    '<button id="retryBtn">Try again</button>'
+    '<p class="muted">Tip: wait for the cone to swing away, sneak (Shift) past, and let crates break the sentry\u2019s line of sight.</p>' +
+    '<button id="retryBtn">Try again</button>',
   );
-  $('retryBtn').onclick = () => loadLevel(level);
+  $('retryBtn').onclick = () => loadLevel(levelIndex);
 }
 
 function levelComplete() {
   phase = 'levelDone';
-  clearInterval(timerId);
+  clearInterval(clockId);
   const timeBonus = Math.ceil(timeLeft) * 5;
-  const ghost = spotted ? 0 : 150;
+  const ghost = everSpotted ? 0 : 150;
   score += timeBonus + ghost;
   sfx.exit();
-  updateHUD();
-  if (level + 1 >= LEVELS.length) {
+  refreshHUD();
+  if (levelIndex + 1 >= LEVELS.length) {
     setTimeout(winGame, 900);
     showOverlay(
       '<h2>Level complete!</h2>' +
-      '<p>Time bonus: <b>+' + timeBonus + '</b>' + (ghost ? ' · Ghost bonus: <b>+' + ghost + '</b>' : '') + '</p>' +
-      '<p class="muted">One moment…</p>'
+      '<p>Time bonus: <b>+' + timeBonus + '</b>' +
+      (ghost ? ' \u00b7 Ghost bonus: <b>+' + ghost + '</b>' : '') + '</p>' +
+      '<p class="muted">One moment\u2026</p>',
     );
   } else {
     showOverlay(
-      '<h2>Level ' + (level + 1) + ' clear!</h2>' +
-      '<p>Time bonus: <b>+' + timeBonus + '</b>' + (ghost ? ' · Ghost bonus: <b>+' + ghost + '</b> (never spotted)' : '') + '</p>' +
-      '<p>Next: <b>' + LEVELS[level + 1].name + '</b> — more guards, faster patrols.</p>' +
-      '<button id="nextBtn">Next level →</button>'
+      '<h2>Level ' + (levelIndex + 1) + ' clear!</h2>' +
+      '<p>Time bonus: <b>+' + timeBonus + '</b>' +
+      (ghost ? ' \u00b7 Ghost bonus: <b>+' + ghost + '</b> (never spotted)' : '') + '</p>' +
+      '<p>Next: <b>' + LEVELS[levelIndex + 1].name + '</b> \u2014 more guards, faster patrols.</p>' +
+      '<button id="nextBtn">Next level \u2192</button>',
     );
-    $('nextBtn').onclick = () => loadLevel(level + 1);
+    $('nextBtn').onclick = () => loadLevel(levelIndex + 1);
   }
 }
 
 function winGame() {
   phase = 'win';
-  clearInterval(timerId);
+  clearInterval(clockId);
   sfx.win();
   showOverlay(
     '<h2>Clean getaway!</h2>' +
     '<p class="big">Final score: <b>' + score + '</b></p>' +
-    '<p>Three vaults, ' + LEVELS.reduce((n, L) => n + (L.map.join('').match(/L/g) || []).length, 0) + ' gems — and the guards never knew you were there. (Or did they?)</p>' +
-    '<button id="againBtn">Play again</button>'
+    '<p>Three vaults, ' +
+    LEVELS.reduce((n, L) => n + (L.map.join('').match(/L/g) || []).length, 0) +
+    ' gems \u2014 and the guards never knew you were there. (Or did they?)</p>' +
+    '<button id="againBtn">Play again</button>',
   );
-  $('againBtn').onclick = () => { score = 0; loadLevel(0); };
+  $('againBtn').onclick = () => {
+    score = 0;
+    loadLevel(0);
+  };
 }
 
 function showTitle() {
@@ -420,19 +518,23 @@ function showTitle() {
   draw();
   showOverlay(
     '<h1>Shadow Heist</h1>' +
-    '<p class="tag">Top-down stealth — slip past the guards, grab the gems, vanish.</p>' +
+    '<p class="tag">Top-down stealth \u2014 slip past the guards, grab the gems, vanish.</p>' +
     '<p>Move with <b>WASD / arrows</b>. Hold <b>Shift</b> to sneak: slower, quieter, harder to spot.<br>' +
-    'Crates block a guard\'s sight. Bushes hide you. A yellow cone means a guard is watching — if it turns red, break line of sight fast.<br>' +
-    'Grab every gem, then reach the green EXIT. 3 vaults, ' + LEVELS.reduce((n, L) => n + (L.map.join('').match(/L/g) || []).length, 0) + ' gems.</p>' +
-    '<button id="playBtn">▶ Start the heist</button>' +
-    '<p class="muted small">M = mute · R = restart level · listen for footsteps: louder means closer.</p>'
+    'Crates block a guard\u2019s sight. Bushes hide you. A yellow cone means a guard is watching \u2014 if it turns red, break line of sight fast.<br>' +
+    'Grab every gem, then reach the green EXIT. 3 vaults, ' +
+    LEVELS.reduce((n, L) => n + (L.map.join('').match(/L/g) || []).length, 0) +
+    ' gems.</p>' +
+    '<button id="playBtn">\u25b6 Start the heist</button>' +
+    '<p class="muted small">M = mute \u00b7 R = restart level \u00b7 listen for footsteps: louder means closer.</p>',
   );
-  $('playBtn').onclick = () => { score = 0; loadLevel(0); };
+  $('playBtn').onclick = () => {
+    score = 0;
+    loadLevel(0);
+  };
 }
 
-// ---------- loop / input ----------
+// ---- loop and input ----
 let last = performance.now();
-let frame = 0;
 function loop(now) {
   const dt = Math.min(0.05, (now - last) / 1000);
   last = now;
@@ -443,24 +545,41 @@ function loop(now) {
 }
 
 window.addEventListener('keydown', (e) => {
-  keys[e.key.toLowerCase()] = true;
-  if (['arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' '].includes(e.key.toLowerCase())) e.preventDefault();
+  pressed[e.key.toLowerCase()] = true;
+  if (['arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' '].includes(e.key.toLowerCase())) {
+    e.preventDefault();
+  }
   if (e.key === 'm' || e.key === 'M') $('muteBtn').click();
-  if (e.key === 'r' || e.key === 'R') { if (phase === 'playing' || phase === 'caught') loadLevel(level); }
+  if (e.key === 'r' || e.key === 'R') {
+    if (phase === 'playing' || phase === 'caught') loadLevel(levelIndex);
+  }
 });
-window.addEventListener('keyup', (e) => { keys[e.key.toLowerCase()] = false; });
+window.addEventListener('keyup', (e) => {
+  pressed[e.key.toLowerCase()] = false;
+});
 
 $('muteBtn').onclick = () => {
   setMuted(!isMuted());
-  $('muteBtn').textContent = isMuted() ? '🔇 Muted' : '🔊 Sound';
+  $('muteBtn').textContent = isMuted() ? '\uD83D\uDD07 Muted' : '\uD83D\uDD0A Sound';
 };
 
-// Test hook: lets a play-test script jump to a level or place the
-// player, so screenshots can show every level without playing through.
+// Test hook: lets a play-test script jump to a level or place the thief,
+// so screenshots can show every level without playing through.
 window.__heist = {
   loadLevel,
-  setPlayer(x, y) { player.x = x; player.y = y; },
-  state() { return { phase, level, alarm, score, loot: loot.filter((l) => l.taken).length }; },
+  setPlayer(x, y) {
+    thief.x = x;
+    thief.y = y;
+  },
+  state() {
+    return {
+      phase,
+      level: levelIndex,
+      alarm,
+      score,
+      loot: gems.filter((g) => g.taken).length,
+    };
+  },
 };
 
 showTitle();
